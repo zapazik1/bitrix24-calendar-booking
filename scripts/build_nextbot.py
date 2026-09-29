@@ -1,73 +1,55 @@
-"""Собирает однофайловые функции для NextBot и проверяет ограничения песочницы.
+"""Собирает однофайловые функции для NextBot.
 
-В песочнице NextBot функция загружается одним файлом, модули уже импортированы,
-а часть синтаксиса Python запрещена. Сборщик склеивает booking/*.py с точкой входа,
-вырезает import и падает, если в итоговом коде есть запрещённые конструкции.
+Платформа принимает функцию одним файлом: пакет booking/ туда не положить.
+Сборщик склеивает модули пакета с точкой входа, поднимает import стандартной
+библиотеки и requests наверх, убирает import самого пакета и проверяет, что файл компилируется.
 
 Запуск: python scripts/build_nextbot.py
 """
 import pathlib
 import re
-import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-LIBRARY = ["booking/slots.py", "booking/bitrix.py", "booking/service.py"]
+MODULES = ["booking/timezones.py", "booking/slots.py", "booking/doctors.py", "booking/bitrix.py", "booking/service.py"]
 ENTRY_POINTS = ["nextbot/check_time.py", "nextbot/create_appointment.py"]
-
-FORBIDDEN = [
-    (re.compile(r"^\s*(import|from)\s+\w", re.M), "import запрещён: модули уже загружены"),
-    (re.compile(r"^\s*def\s+_", re.M), "имя функции не может начинаться с «_»"),
-    (re.compile(r"\bstr[fp]time\("), "strptime и strftime в песочнице не работают"),
-    (re.compile(r"^\s*[A-Za-z_]\w*\s*,\s*[A-Za-z_]\w*[ \t\w,]*=(?!=)", re.M), "распаковка кортежа запрещена"),
-    (re.compile(r"^\s*for\s+\w+\s*,\s*\w+\s+in\b", re.M), "распаковка в цикле for запрещена"),
-]
+IMPORT_RE = re.compile(r"^(import \w[\w.]*|from [\w.]+ import [^(]+)$")
 
 
-def strip_imports(source):
-    """Удаляет строки import, включая многострочные from x import (...)."""
-    lines = source.splitlines()
-    kept = []
-    skipping = False
-    for line in lines:
+def split_imports(source):
+    """-> (внешние import, тело без import). Многострочные import пакета booking вырезаются целиком."""
+    imports, body, skipping = [], [], False
+    for line in source.splitlines():
         if skipping:
-            if ")" in line:
-                skipping = False
+            skipping = ")" not in line
             continue
-        if re.match(r"^(import|from)\s+\w", line):
-            if "(" in line and ")" not in line:
-                skipping = True
+        if line.startswith("from booking"):
+            skipping = "(" in line and ")" not in line
             continue
-        kept.append(line)
-    return "\n".join(kept) + "\n"
-
-
-def check(source, name):
-    problems = []
-    for pattern, message in FORBIDDEN:
-        for match in pattern.finditer(source):
-            line_no = source.count("\n", 0, match.start()) + 1
-            problems.append(f"{name}:{line_no}: {message}")
-    return problems
+        if IMPORT_RE.match(line):
+            imports.append(line)
+            continue
+        body.append(line)
+    return imports, "\n".join(body).strip() + "\n"
 
 
 def build():
-    library = "".join(strip_imports((ROOT / path).read_text(encoding="utf-8")) for path in LIBRARY)
-    problems = []
+    built = []
+    parts = [split_imports((ROOT / m).read_text(encoding="utf-8")) for m in MODULES]
     for entry in ENTRY_POINTS:
-        body = (ROOT / entry).read_text(encoding="utf-8")
-        header = f"# Собрано scripts/build_nextbot.py из booking/ и {entry}. Не редактировать вручную.\n"
-        built = header + library + "\n" + body
+        entry_imports, entry_body = split_imports((ROOT / entry).read_text(encoding="utf-8"))
+        imports = sorted(set(entry_imports + [i for p in parts for i in p[0]]))
+        text = "\n\n".join(
+            [f"# Собрано scripts/build_nextbot.py из booking/ и {entry}. Не редактировать вручную.",
+             "\n".join(imports)] + [p[1] for p in parts] + [entry_body]
+        )
         target = ROOT / "dist" / pathlib.Path(entry).name
         target.parent.mkdir(exist_ok=True)
-        target.write_text(built, encoding="utf-8")
-        compile(built, str(target), "exec")
-        problems.extend(check(built, target.name))
-    return problems
+        target.write_text(text, encoding="utf-8")
+        compile(text, str(target), "exec")
+        built.append(target)
+    return built
 
 
 if __name__ == "__main__":
-    found = build()
-    if found:
-        print("\n".join(found))
-        sys.exit(1)
-    print("Готово: dist/check_time.py, dist/create_appointment.py")
+    for path in build():
+        print(path.relative_to(ROOT))

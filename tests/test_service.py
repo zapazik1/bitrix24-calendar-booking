@@ -1,74 +1,65 @@
-"""Сценарии функций агента на подменённом Bitrix24 API."""
-import booking.bitrix as bitrix
+import datetime as dt
+import json
+
+from booking.bitrix import Bitrix
 from booking.service import DEFAULT_CONFIG, check_time, create_appointment
+from tests.fake_bitrix import PORTAL, FakePortal
 
-CONFIG = dict(DEFAULT_CONFIG, clinic_tz="Asia/Yekaterinburg", booking_template_id=7, days_to_search=2)
-
-
-class FakeResponse:
-    def __init__(self, payload, status=200):
-        self.payload = payload
-        self.status_code = status
-
-    def json(self):
-        return self.payload
+CFG = dict(DEFAULT_CONFIG, booking_template_id=7, lead_booking_fields=["UF_CRM_BOOKING_DATE"],
+           directory={"entity_type_id": 1, "field_doctor_ids": "ufCrm0Doctors", "field_doctor_names": "ufCrm0DoctorFio"})
+NOW = dt.datetime(2099, 6, 14, 3, 0, tzinfo=dt.timezone.utc)   # 08:00 в клинике накануне
 
 
-def fake_bitrix(events, workflow_ok=True):
-    """Подменяет requests.post: отвечает на методы по имени."""
-    def post(url, json, timeout):
-        method = url.rsplit("/", 1)[-1]
-        if method == "user.search":
-            return FakeResponse({"result": [{"ID": "42", "NAME": "Анна", "LAST_NAME": "Иванова"}]})
-        if method == "calendar.event.get":
-            day = json["from"][:10]
-            return FakeResponse({"result": [e for e in events if e["day"] == day]})
-        if method == "bizproc.workflow.start":
-            if workflow_ok:
-                return FakeResponse({"result": "wf-1"})
-            return FakeResponse({"error": "ACCESS_DENIED", "error_description": "Нет прав"}, 403)
-        raise AssertionError(method)
-    return post
+def payload(result):
+    return json.loads(result["tool_result"])
 
 
-def event(day, start, end, tz="Asia/Yekaterinburg"):
-    return {"day": day, "DATE_FROM": start, "DATE_TO": end, "TZ_FROM": tz}
+def moscow_event(start, end):
+    return {"DATE_FROM": start, "DATE_TO": end, "TZ_FROM": "Europe/Moscow", "TZ_TO": "Europe/Moscow"}
 
 
-def test_free_time(monkeypatch):
-    monkeypatch.setattr(bitrix.requests, "post", fake_bitrix([]))
-    answer = check_time(CONFIG, "Иванова Анна", "15.06.2099 10:00", 30)
-    assert answer["status"] == "free"
+def test_check_time_reads_events_in_their_timezone(monkeypatch):
+    # 08:00–09:00 по Москве = 10:00–11:00 в клинике.
+    FakePortal({"101": [moscow_event("15.06.2099 08:00:00", "15.06.2099 09:00:00")]}).install(monkeypatch)
+    args = {"doctor_calendar_id": 101, "appointment_duration": 30,
+            "start_time": "15.06.2099 10:00", "end_time": "15.06.2099 12:00"}
+    answer = payload(check_time(CFG, Bitrix(PORTAL), args, now_utc=NOW))
+    assert answer["slots"] == ["15.06.2099 11:00", "15.06.2099 11:30"]
 
 
-def test_event_from_other_timezone_blocks_local_time(monkeypatch):
-    # Событие создано из Москвы на 08:00, в клинике (UTC+5) это 10:00.
-    events = [event("2099-06-15", "15.06.2099 08:00:00", "15.06.2099 09:00:00", tz="Europe/Moscow")]
-    monkeypatch.setattr(bitrix.requests, "post", fake_bitrix(events))
-    answer = check_time(CONFIG, "Иванова Анна", "15.06.2099 10:00", 30)
-    assert answer["status"] == "busy"
-    assert answer["alternatives"][0] == "15.06.2099 11:00"
+def test_first_booking_goes_through_workflow_in_owner_timezone(monkeypatch):
+    portal = FakePortal(lead={}).install(monkeypatch)
+    args = {"doctor_calendar_id": 101, "appointment_duration": 30, "appointment_datetime": "15.06.2099 10:00",
+            "bitrixEntityId": "LEAD_77", "medical_services": "Консультация"}
+    result = create_appointment(CFG, Bitrix(PORTAL), args, now_utc=NOW)
+    assert payload(result)["status"] == "success" and result["tags"] == ["booked"]
+    workflow = [body for method, body in portal.calls if method == "bizproc.workflow.start"][0]
+    # 10:00 в UTC+5 — это 08:00 для владельца вебхука в UTC+3.
+    assert workflow["PARAMETERS"]["StartDate"] == "2099-06-15T08:00:00"
+    assert workflow["DOCUMENT_ID"] == ["crm", "CCrmDocumentLead", "LEAD_77"]
 
 
-def test_booking_error_tells_agent_not_to_confirm(monkeypatch):
-    monkeypatch.setattr(bitrix.requests, "post", fake_bitrix([], workflow_ok=False))
-    answer = create_appointment(CONFIG, "Иванова Анна", "15.06.2099 10:00", 30, 123, "Консультация")
-    assert answer["status"] == "error"
-    assert "Не подтверждай" in answer["instruction"]
+def test_additional_booking_writes_event_with_timezone_keys(monkeypatch):
+    portal = FakePortal(lead={"UF_CRM_BOOKING_DATE": "2099-06-10"}).install(monkeypatch)
+    args = {"doctor_name": "Ивановой Анне", "appointment_duration": 30, "appointment_datetime": "15.06.2099 10:00",
+            "bitrixEntityId": "77", "medical_services": "Повторный приём"}
+    assert payload(create_appointment(CFG, Bitrix(PORTAL), args, now_utc=NOW))["calendar_event_id"] == 5555
+    event = [body for method, body in portal.calls if method == "calendar.event.add"][0]
+    assert event["timezone_from"] == event["timezone_to"] == "Asia/Yekaterinburg"
+    assert "tzFrom" not in event and event["from"] == "2099-06-15T10:00:00"
 
 
-def test_booking_success(monkeypatch):
-    monkeypatch.setattr(bitrix.requests, "post", fake_bitrix([]))
-    answer = create_appointment(CONFIG, "Иванова Анна", "15.06.2099 10:00", 30, 123, "Консультация")
-    assert answer == {
-        "status": "success",
-        "slot": "15.06.2099 10:00",
-        "workflow_id": "wf-1",
-        "instruction": "Запись создана. Подтверди клиенту врача, дату и время.",
-    }
+def test_bitrix_error_means_no_confirmation(monkeypatch):
+    FakePortal(lead={}, fail={"bizproc.workflow.start"}).install(monkeypatch)
+    args = {"doctor_calendar_id": 101, "appointment_duration": 30, "appointment_datetime": "15.06.2099 10:00",
+            "bitrixEntityId": "77"}
+    result = create_appointment(CFG, Bitrix(PORTAL), args, now_utc=NOW)
+    assert payload(result)["status"] == "error"
+    assert "Не подтверждай" in payload(result)["instruction"] and result["tags"] == ["booking_error"]
 
 
-def test_time_outside_working_hours_is_rejected(monkeypatch):
-    monkeypatch.setattr(bitrix.requests, "post", fake_bitrix([]))
-    answer = check_time(CONFIG, "Иванова Анна", "15.06.2099 19:50", 30)
-    assert answer["status"] == "invalid"
+def test_busy_slot(monkeypatch):
+    FakePortal({"101": [moscow_event("15.06.2099 08:00:00", "15.06.2099 09:00:00")]}, lead={}).install(monkeypatch)
+    args = {"doctor_calendar_id": 101, "appointment_duration": 30, "appointment_datetime": "15.06.2099 10:30",
+            "bitrixEntityId": "77"}
+    assert payload(create_appointment(CFG, Bitrix(PORTAL), args, now_utc=NOW))["status"] == "busy"

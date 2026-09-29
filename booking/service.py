@@ -1,138 +1,119 @@
-"""Две функции для ИИ-агента: проверить время и записать пациента.
+"""Функции агента: check_time и create_appointment.
 
-Ответ каждой функции адресован модели: статус, факты и инструкция, что говорить клиенту.
-Главное правило: если запись не подтвердил Bitrix24, агент не подтверждает её клиенту.
+Ответ — в структурированном контракте платформы: tool_result читает модель,
+tags помечают диалог. Главное правило: если Bitrix24 не подтвердил запись,
+агент не подтверждает её пациенту.
 """
 import datetime
+import json
 
-from booking.bitrix import find_employee_id, get_busy_intervals, start_booking_workflow
-from booking.slots import (
-    format_datetime,
-    is_free,
-    parse_datetime,
-    shift_timezone,
-    suggest_alternatives,
-)
+from booking.bitrix import BitrixError
+from booking.doctors import resolve_doctor
+from booking.slots import free_slots_in_range, is_free
+from booking.timezones import clinic_now, format_for_patient, parse_bitrix_datetime
 
 DEFAULT_CONFIG = {
-    "webhook_url": "https://example.bitrix24.ru/rest/1/REPLACE_ME/",
-    "clinic_tz": "Asia/Yekaterinburg",
-    "work_start": "08:00",
-    "work_end": "20:00",
+    "clinic_tz": "Asia/Yekaterinburg",       # эталонный пояс: в нём ищем и называем время
+    "webhook_owner_tz": "Europe/Moscow",     # пояс пользователя, от имени которого вебхук
+    "work_start": datetime.time(8, 0),
+    "work_end": datetime.time(20, 0),
+    "min_lead_minutes": 30,                  # не предлагать слоты раньше, чем через 30 минут
+    "max_slots": 30,
+    "directory": {"entity_type_id": 0, "field_doctor_ids": "", "field_doctor_names": ""},
     "booking_template_id": 0,
-    "days_to_search": 3,
-    "slots_to_suggest": 3,
+    "lead_booking_fields": [],               # поля лида, заполненные первой записью
 }
 
 
-def parse_clock(value):
-    parts = value.split(":")
-    return datetime.time(int(parts[0]), int(parts[1]))
+def reply(status, instruction, tags=None, **facts):
+    payload = {"status": status, **facts, "instruction": instruction}
+    result = {"tool_result": json.dumps(payload, ensure_ascii=False, default=str)}
+    if tags:
+        result["tags"] = tags
+    return result
 
 
-def clinic_now(clinic_tz):
-    utc_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    return shift_timezone(utc_now, "UTC", clinic_tz)
+def failed(reason):
+    return reply("error", "Запись не создана. Не подтверждай время пациенту, передай диалог администратору.",
+                 tags=["booking_error"], reason=reason)
 
 
-def error_result(reason):
-    return {
-        "status": "error",
-        "reason": reason,
-        "instruction": "Запись не создана. Не подтверждай время клиенту. Передай диалог администратору.",
-    }
+def doctor_from_args(cfg, bitrix, args):
+    d = cfg["directory"]
+    directory = bitrix.load_directory(d["entity_type_id"], d["field_doctor_ids"], d["field_doctor_names"])
+    return resolve_doctor(directory, args.get("doctor_calendar_id"), args.get("doctor_name"))
 
 
-def collect_busy(config, doctor_id, first_day):
-    """Занятость врача на несколько дней вперёд: список пар [дата, интервалы]."""
-    days = []
-    for offset in range(config["days_to_search"]):
-        day = first_day + datetime.timedelta(days=offset)
-        loaded = get_busy_intervals(config["webhook_url"], doctor_id, day, config["clinic_tz"])
-        if not loaded["ok"]:
-            return {"ok": False, "days": [], "error": loaded["error"]}
-        days.append([day, loaded["busy"]])
-    return {"ok": True, "days": days, "error": None}
+def check_time(cfg, bitrix, args, now_utc=None):
+    """Свободные слоты врача в диапазоне start_time–end_time (ДД.ММ.ГГГГ ЧЧ:ММ)."""
+    try:
+        doctor_id, doctor_name, problem = doctor_from_args(cfg, bitrix, args)
+        if problem:
+            return reply("invalid", problem)
+        start = parse_bitrix_datetime(args.get("start_time"))
+        end = parse_bitrix_datetime(args.get("end_time"))
+        duration = int(args.get("appointment_duration") or 0)
+        if start is None or end is None or duration <= 0 or start >= end:
+            return reply("invalid", "Нужны start_time и end_time в формате ДД.ММ.ГГГГ ЧЧ:ММ и длительность больше нуля.")
+
+        not_before = clinic_now(cfg["clinic_tz"], now_utc) + datetime.timedelta(minutes=cfg["min_lead_minutes"])
+        busy = bitrix.busy_intervals(doctor_id, start.date(), end.date(), cfg["clinic_tz"])
+        slots = free_slots_in_range(busy, start, end, duration, cfg["work_start"], cfg["work_end"],
+                                    not_before=not_before, limit=cfg["max_slots"])
+    except BitrixError as exc:
+        return failed(str(exc))
+
+    if not slots:
+        return reply("no_slots", "В этом диапазоне свободного времени нет. Предложи другой день или другого врача.",
+                     doctor=doctor_name)
+    return reply("success", "Назови пациенту только эти варианты. Другого времени не предлагай.",
+                 doctor=doctor_name, doctor_calendar_id=doctor_id,
+                 slots=[format_for_patient(s) for s in slots])
 
 
-def validate_request(config, doctor_name, requested, duration_minutes):
-    """Проверки до обращения к календарю. Возвращает текст ошибки или None."""
-    if not doctor_name:
-        return "Не указан врач."
-    if requested is None:
-        return "Дата и время не распознаны. Ожидается ДД.ММ.ГГГГ ЧЧ:ММ."
-    if duration_minutes <= 0:
-        return "Длительность приёма должна быть больше нуля."
-    if requested < clinic_now(config["clinic_tz"]):
-        return "Запрошенное время уже прошло."
-    start = parse_clock(config["work_start"])
-    end = parse_clock(config["work_end"])
-    finish = requested + datetime.timedelta(minutes=duration_minutes)
-    if requested.time() < start or finish.time() > end or finish.date() != requested.date():
-        return f"Приём возможен с {config['work_start']} до {config['work_end']}."
-    return None
+def create_appointment(cfg, bitrix, args, now_utc=None):
+    """Запись пациента. Первая запись по лиду — бизнес-процессом, следующие — событием в календаре."""
+    try:
+        doctor_id, doctor_name, problem = doctor_from_args(cfg, bitrix, args)
+        if problem:
+            return reply("invalid", problem)
+        start = parse_bitrix_datetime(args.get("appointment_datetime"))
+        duration = int(args.get("appointment_duration") or 0)
+        lead_id = int(str(args.get("bitrixEntityId") or "").replace("LEAD_", "") or 0)
+        if start is None or duration <= 0 or not lead_id:
+            return reply("invalid", "Нужны время приёма ДД.ММ.ГГГГ ЧЧ:ММ, длительность и лид диалога.")
+        end = start + datetime.timedelta(minutes=duration)
+        if start < clinic_now(cfg["clinic_tz"], now_utc):
+            return reply("invalid", "Это время уже прошло. Предложи пациенту другое.")
+        if start.time() < cfg["work_start"] or end.time() > cfg["work_end"] or end.date() != start.date():
+            return reply("invalid", "Время вне часов приёма клиники.")
 
+        busy = bitrix.busy_intervals(doctor_id, start.date(), start.date(), cfg["clinic_tz"])
+        if not is_free(busy, start, end):
+            return reply("busy", "Время уже занято. Вызови check_time и предложи пациенту свободные варианты.")
 
-def check_time(config, doctor_name, requested_text, duration_minutes):
-    """Функция агента check_time: свободно ли время и какие есть варианты."""
-    requested = parse_datetime(requested_text)
-    problem = validate_request(config, doctor_name, requested, duration_minutes)
-    if problem:
-        return {"status": "invalid", "reason": problem,
-                "instruction": "Уточни у клиента данные и вызови функцию снова."}
+        service = str(args.get("medical_services") or "")
+        if bitrix.lead_has_booking(lead_id, cfg["lead_booking_fields"]):
+            # Повторная проверка прямо перед записью: слот могли занять за секунды разговора.
+            busy = bitrix.busy_intervals(doctor_id, start.date(), start.date(), cfg["clinic_tz"])
+            if not is_free(busy, start, end):
+                return reply("busy", "Слот только что заняли. Вызови check_time и предложи другое время.")
+            event_id = bitrix.add_calendar_event(
+                doctor_id, start, duration, cfg["clinic_tz"],
+                name=f"Доп. запись: {service} | лид {lead_id}",
+                description="Создано ИИ-агентом",
+            )
+            booking = {"calendar_event_id": event_id}
+        else:
+            workflow_id = bitrix.start_booking_workflow(
+                cfg["booking_template_id"], lead_id, start, cfg["clinic_tz"], cfg["webhook_owner_tz"],
+                {"Service": service, "Employee": f"user_{doctor_id}", "duration": duration},
+            )
+            booking = {"workflow_id": workflow_id}
+    except BitrixError as exc:
+        return failed(str(exc))
 
-    doctor_id = find_employee_id(config["webhook_url"], doctor_name)
-    if doctor_id is None:
-        return {"status": "invalid", "reason": f"Врач «{doctor_name}» не найден.",
-                "instruction": "Уточни у клиента имя врача по списку специалистов."}
-
-    loaded = collect_busy(config, doctor_id, requested.date())
-    if not loaded["ok"]:
-        return error_result(loaded["error"])
-
-    finish = requested + datetime.timedelta(minutes=duration_minutes)
-    if is_free(loaded["days"][0][1], requested, finish):
-        return {"status": "free", "slot": format_datetime(requested), "doctor_id": doctor_id,
-                "instruction": "Время свободно. Получи согласие клиента и вызови create_appointment."}
-
-    alternatives = suggest_alternatives(
-        loaded["days"], requested, duration_minutes,
-        parse_clock(config["work_start"]), parse_clock(config["work_end"]),
-        limit=config["slots_to_suggest"],
-    )
-    return {
-        "status": "busy",
-        "alternatives": [format_datetime(slot) for slot in alternatives],
-        "instruction": "Время занято. Предложи клиенту только эти варианты, другого времени не называй."
-        if alternatives else "Свободного времени в ближайшие дни нет. Предложи записаться к другому врачу.",
-    }
-
-
-def create_appointment(config, doctor_name, requested_text, duration_minutes, deal_id, service_name):
-    """Функция агента create_appointment: повторная проверка и запуск бизнес-процесса записи.
-
-    Время проверяется ещё раз прямо перед записью: между check_time и согласием клиента
-    слот мог занять администратор или другой пациент.
-    """
-    checked = check_time(config, doctor_name, requested_text, duration_minutes)
-    if checked["status"] != "free":
-        return checked
-
-    requested = parse_datetime(requested_text)
-    started = start_booking_workflow(
-        config["webhook_url"], config["booking_template_id"], deal_id,
-        {
-            "Service": service_name,
-            "StartDate": requested.isoformat(),
-            "Employee": f"user_{checked['doctor_id']}",
-            "Duration": duration_minutes,
-        },
-    )
-    if not started["ok"]:
-        return error_result(started["error"])
-    return {
-        "status": "success",
-        "slot": format_datetime(requested),
-        "workflow_id": started["workflow_id"],
-        "instruction": "Запись создана. Подтверди клиенту врача, дату и время.",
-    }
+    if not any(booking.values()):
+        return failed("Bitrix24 не вернул ID записи")
+    return reply("success", "Запись создана. Подтверди пациенту врача, дату и время.",
+                 tags=["booked"], doctor=doctor_name, slot=format_for_patient(start), **booking)

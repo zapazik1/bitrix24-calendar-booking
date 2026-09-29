@@ -1,19 +1,15 @@
-# Точка входа функции check_time в NextBot.
-# scripts/build_nextbot.py ставит перед этим файлом код из booking/ без строк import.
+# Функция check_time для NextBot.
 # Параметры, которые агент заполняет из диалога:
-#   args["doctor_name"]           ФИО врача из справочника
-#   args["appointment_datetime"]  ДД.ММ.ГГГГ ЧЧ:ММ
-#   args["duration_minutes"]      длительность услуги
+#   doctor_calendar_id    ID календаря из ответа get_doctors_and_services (предпочтительно)
+#   doctor_name           ФИО врача, запасной путь
+#   appointment_duration  длительность услуги в минутах
+#   start_time, end_time  диапазон поиска, ДД.ММ.ГГГГ ЧЧ:ММ
+import datetime
 
 CONFIG = dict(DEFAULT_CONFIG)
 CONFIG.update({
     "webhook_url": "https://example.bitrix24.ru/rest/1/REPLACE_ME/",
-    "clinic_tz": "Asia/Yekaterinburg",
+    "directory": {"entity_type_id": 0, "field_doctor_ids": "ufCrm0Doctors", "field_doctor_names": "ufCrm0DoctorFio"},
 })
 
-result = check_time(
-    CONFIG,
-    args.get("doctor_name", ""),
-    args.get("appointment_datetime", ""),
-    int(args.get("duration_minutes") or 20),
-)
+result = check_time(CONFIG, Bitrix(CONFIG["webhook_url"]), args)

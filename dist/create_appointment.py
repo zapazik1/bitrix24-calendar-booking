@@ -1,372 +1,433 @@
 # Собрано scripts/build_nextbot.py из booking/ и nextbot/create_appointment.py. Не редактировать вручную.
-"""Поиск свободного времени в календаре врача.
 
-Код совместим с песочницей Python на платформе NextBot:
-без распаковки кортежей, без strptime/strftime, без функций с «_» в начале имени.
-Строки import удаляет сборщик scripts/build_nextbot.py: в песочнице модули уже загружены.
+from zoneinfo import ZoneInfo
+import datetime
+import json
+import math
+import requests
+
+"""Часовые пояса календаря Bitrix24.
+
+Что показала работа с порталом клиники:
+  * calendar.event.get отдаёт DATE_FROM во времени пояса самого события (TZ_FROM),
+    а не того, кто читает; сравнивать DATE_FROM разных событий как строки нельзя;
+  * поле DATE_FROM_TS_UTC расходилось с DATE_FROM на несколько часов, ему не доверяем;
+  * у врачей одного портала бывают разные пояса, а у части сотрудников пояс не задан
+    и календарь живёт в поясе портала по умолчанию.
+
+Поэтому всё время приводится к одному эталонному поясу — поясу клиники.
+В нём агент ищет слоты и в нём называет время пациенту.
 """
 
-# Смещения от UTC для поясов без перехода на летнее время.
-# В песочнице нет zoneinfo, поэтому таблица задана явно.
-UTC_OFFSETS_HOURS = {
-    "UTC": 0,
-    "Europe/Moscow": 3,
-    "Europe/Samara": 4,
-    "Asia/Yekaterinburg": 5,
-    "Asia/Almaty": 5,
-    "Asia/Tashkent": 5,
-    "Asia/Omsk": 6,
-    "Asia/Novosibirsk": 7,
-}
+BITRIX_DATETIME = "%d.%m.%Y %H:%M:%S"
 
 
-def parse_datetime(value):
+def parse_bitrix_datetime(value):
     """'ДД.ММ.ГГГГ ЧЧ:ММ[:СС]' -> datetime без пояса или None."""
     if not isinstance(value, str):
         return None
-    parts = value.strip().split(" ")
-    if len(parts) != 2:
-        return None
-    date_parts = parts[0].split(".")
-    time_parts = parts[1].split(":")
-    if len(date_parts) != 3 or len(time_parts) not in (2, 3):
-        return None
-    try:
-        second = int(time_parts[2]) if len(time_parts) == 3 else 0
-        return datetime.datetime(
-            int(date_parts[2]), int(date_parts[1]), int(date_parts[0]),
-            int(time_parts[0]), int(time_parts[1]), second,
-        )
-    except ValueError:
-        return None
+    text = value.strip()
+    for pattern in (BITRIX_DATETIME, "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    return None
 
 
-def format_datetime(dt):
-    """datetime -> 'ДД.ММ.ГГГГ ЧЧ:ММ' без strftime."""
-    return f"{dt.day:02d}.{dt.month:02d}.{dt.year:04d} {dt.hour:02d}:{dt.minute:02d}"
+def to_clinic_time(naive, source_tz, clinic_tz):
+    """Время события из его пояса -> время клиники, без tzinfo."""
+    if not source_tz or source_tz == clinic_tz:
+        return naive
+    aware = naive.replace(tzinfo=ZoneInfo(source_tz))
+    return aware.astimezone(ZoneInfo(clinic_tz)).replace(tzinfo=None)
 
 
-def shift_timezone(dt, from_tz, to_tz):
-    """Переводит время из пояса from_tz в пояс to_tz."""
-    if not from_tz or not to_tz or from_tz == to_tz:
-        return dt
-    if from_tz not in UTC_OFFSETS_HOURS or to_tz not in UTC_OFFSETS_HOURS:
-        raise ValueError(f"Нет смещения для пояса: {from_tz} или {to_tz}")
-    hours = UTC_OFFSETS_HOURS[to_tz] - UTC_OFFSETS_HOURS[from_tz]
-    return dt + datetime.timedelta(hours=hours)
+def clinic_now(clinic_tz, now_utc=None):
+    moment = now_utc or datetime.datetime.now(datetime.timezone.utc)
+    return moment.astimezone(ZoneInfo(clinic_tz)).replace(tzinfo=None)
+
+
+def format_for_patient(dt):
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+"""Поиск свободного времени в календаре врача. Все datetime — во времени клиники, без tzinfo."""
 
 
 def overlaps(start_a, end_a, start_b, end_b):
-    """Пересекаются ли два интервала. Касание концами не считается пересечением."""
+    """Пересекаются ли интервалы. Касание концами пересечением не считается."""
     return start_a < end_b and end_a > start_b
 
 
 def is_free(busy, start, end):
-    """Свободен ли интервал [start, end) при заданных занятых интервалах."""
-    for item in busy:
-        if overlaps(start, end, item["start"], item["end"]):
-            return False
-    return True
+    return not any(overlaps(start, end, item["start"], item["end"]) for item in busy)
 
 
 def round_up_to_grid(dt, step_minutes):
-    """Округляет вверх до сетки step_minutes от начала суток: 10:05 при шаге 20 -> 10:20."""
+    """Вверх до сетки step_minutes от начала суток: 10:05 при шаге 20 -> 10:20."""
     if step_minutes <= 0:
         return dt
     day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds = (dt - day_start).total_seconds()
     step = step_minutes * 60
+    seconds = (dt - day_start).total_seconds()
     return day_start + datetime.timedelta(seconds=math.ceil(seconds / step) * step)
 
 
-def find_free_slots(busy, day, duration_minutes, work_start, work_end, limit=3, not_before=None):
-    """Свободные слоты на день по сетке длительности приёма.
+def free_slots_in_range(busy, start, end, duration_minutes, work_start, work_end, not_before=None, limit=None):
+    """Все свободные слоты сетки в диапазоне [start, end] с учётом рабочих часов.
 
-    busy: список {"start": datetime, "end": datetime} во времени клиники.
-    work_start, work_end: datetime.time рабочего дня врача.
-    not_before: не предлагать слоты раньше этого момента (например, «сейчас»).
+    busy: список {"start", "end"}; work_start, work_end: datetime.time.
+    not_before: не предлагать слоты раньше этого момента, например «сейчас + 30 минут».
     """
     step = datetime.timedelta(minutes=duration_minutes)
-    day_open = datetime.datetime.combine(day, work_start)
-    day_close = datetime.datetime.combine(day, work_end)
-
-    cursor = day_open
-    if not_before is not None and not_before > cursor:
-        cursor = not_before
-    cursor = round_up_to_grid(cursor, duration_minutes)
-
     slots = []
-    while len(slots) < limit and cursor + step <= day_close:
-        slot_end = cursor + step
-        blocker = None
-        for item in busy:
-            if overlaps(cursor, slot_end, item["start"], item["end"]):
-                blocker = item
-                break
-        if blocker is None:
-            slots.append(cursor)
-            cursor = slot_end
-        else:
-            # Прыгаем сразу за конец мешающего события и выравниваем по сетке.
-            cursor = round_up_to_grid(blocker["end"], duration_minutes)
+    day = start.date()
+    while day <= end.date():
+        day_open = max(start, datetime.datetime.combine(day, work_start))
+        day_close = min(end, datetime.datetime.combine(day, work_end))
+        if not_before is not None:
+            day_open = max(day_open, not_before)
+        cursor = round_up_to_grid(day_open, duration_minutes)
+        while cursor + step <= day_close:
+            slot_end = cursor + step
+            blocker = next((b for b in busy if overlaps(cursor, slot_end, b["start"], b["end"])), None)
+            if blocker is None:
+                slots.append(cursor)
+                if limit and len(slots) >= limit:
+                    return slots
+                cursor = slot_end
+            else:
+                # Сразу за конец мешающего события, снова по сетке.
+                cursor = round_up_to_grid(blocker["end"], duration_minutes)
+        day += datetime.timedelta(days=1)
     return slots
 
 
-def suggest_alternatives(busy_by_day, requested_start, duration_minutes, work_start, work_end, limit=3):
-    """Ближайшие свободные слоты после запрошенного времени, по дням подряд.
+"""Какой календарь открыть: врач по справочнику, а не поиском по ФИО на портале.
 
-    busy_by_day: список пар [дата, занятые интервалы], отсортированный по дате.
-    """
-    found = []
-    for entry in busy_by_day:
-        day = entry[0]
-        busy = entry[1]
-        not_before = requested_start if day == requested_start.date() else None
-        day_slots = find_free_slots(
-            busy, day, duration_minutes, work_start, work_end,
-            limit=limit - len(found), not_before=not_before,
-        )
-        found.extend(day_slots)
-        if len(found) >= limit:
-            break
-    return found
-"""Тонкий клиент Bitrix24 REST API через входящий вебхук.
+Поиск сотрудника по ФИО через user.search ошибался: в профилях к ФИО дописана
+специальность, встречаются буквы национальных алфавитов и тёзки. Теперь в CRM есть
+справочник «Услуги и врачи» (смарт-процесс): в каждой строке услуги перечислены
+врачи и ID сотрудника — владельца календаря. Функция каталога услуг отдаёт агенту
+doctor_calendar_id, и запись идёт строго в этот календарь.
 
-Совместим с песочницей NextBot: requests и json там уже загружены.
+Правило: при любой неоднозначности вернуть ошибку с подсказкой агенту, а не угадывать.
 """
+LETTERS = str.maketrans("әғқңөұүһіё", "агкноуухие")
+
+
+def norm_name(value):
+    """Регистр, пунктуация, двойные пробелы и буквы вроде «ә» или «ё» не важны."""
+    text = str(value or "").lower().translate(LETTERS)
+    text = "".join(ch if ch.isalnum() else " " for ch in text)
+    return " ".join(text.split())
+
+
+def name_words_match(query, fio):
+    """Каждое слово запроса совпадает со своим словом ФИО с учётом падежа:
+    «к Ивановой Анне» -> «Иванова Анна Сергеевна»."""
+    free = fio.split()
+    for word in query.split():
+        hit = None
+        for i, candidate in enumerate(free):
+            shortest = min(len(word), len(candidate))
+            # у коротких слов падеж меняет последнюю букву, у длинных — до двух
+            stem = max(3, shortest - 1) if shortest <= 5 else max(4, shortest - 2)
+            if word == candidate or (shortest >= 4 and word[:stem] == candidate[:stem]):
+                hit = i
+                break
+        if hit is None:
+            return False
+        free.pop(hit)
+    return True
+
+
+def build_directory(rows, field_doctor_ids, field_doctor_names):
+    """Строки справочника -> {ФИО: множество ID календарей}, {ID календаря: [ФИО]}."""
+    by_name, by_id = {}, {}
+    for row in rows:
+        ids = {int(i) for i in (row.get(field_doctor_ids) or [])}
+        for fio in row.get(field_doctor_names) or []:
+            fio = str(fio).strip()
+            by_name.setdefault(fio, set()).update(ids)
+            for calendar_id in ids:
+                names = by_id.setdefault(calendar_id, [])
+                if fio not in names:
+                    names.append(fio)
+    return by_name, by_id
+
+
+def resolve_doctor(directory, calendar_id=None, name=None):
+    """-> (ID календаря, ФИО для сообщений, текст ошибки для агента)."""
+    by_name, by_id = directory
+    name = str(name or "").strip()
+
+    candidates, ids_by_name = [], set()
+    if name:
+        query = norm_name(name)
+        candidates = [fio for fio in by_name if norm_name(fio) == query]
+        if not candidates:
+            candidates = [fio for fio in by_name if name_words_match(query, norm_name(fio))]
+        for fio in candidates:
+            ids_by_name |= by_name[fio]
+
+    if calendar_id not in (None, ""):
+        try:
+            calendar_id = int(str(calendar_id).strip())
+        except ValueError:
+            return None, None, f"doctor_calendar_id должен быть числом, получено: «{calendar_id}»."
+        if calendar_id not in by_id:
+            return None, None, ("Такого календаря нет в справочнике. "
+                                "Возьми doctor_calendar_id из ответа get_doctors_and_services.")
+        if candidates and calendar_id not in ids_by_name:
+            return None, None, (f"Врач «{name}» и календарь {calendar_id} ({', '.join(by_id[calendar_id])}) "
+                                "не совпадают. Возьми врача и его календарь из одной строки справочника.")
+        return calendar_id, name or ", ".join(by_id[calendar_id]), None
+
+    if not name:
+        return None, None, "Не передан врач: нужен doctor_calendar_id или doctor_name."
+    if not candidates:
+        return None, None, f"Врач «{name}» не найден в справочнике услуг и врачей."
+    if not ids_by_name:
+        return None, None, f"У врача «{name}» нет календаря в Bitrix24: записать через агента нельзя."
+    if len(ids_by_name) > 1:
+        options = "; ".join(f"{fio} ({', '.join(map(str, sorted(by_name[fio])))})" for fio in candidates)
+        return None, None, f"Под «{name}» подходят разные врачи: {options}. Уточни у пациента ФИО."
+    return next(iter(ids_by_name)), name, None
+
+
+"""Вызовы Bitrix24 REST через входящий вебхук."""
 
 
 
-
-def bitrix_call(webhook_url, method, params):
-    """Вызывает метод REST API. Возвращает {"ok", "result", "error"} и не бросает исключений."""
-    url = webhook_url.rstrip("/") + "/" + method
-    try:
-        response = requests.post(url, json=params, timeout=15)
-        data = response.json()
-    except (requests.exceptions.RequestException, ValueError) as exc:
-        return {"ok": False, "result": None, "error": f"{method}: {exc}"}
-    if response.status_code != 200 or "error" in data:
-        message = data.get("error_description") or data.get("error") or response.status_code
-        return {"ok": False, "result": None, "error": f"{method}: {message}"}
-    return {"ok": True, "result": data.get("result"), "error": None}
+TIMEOUT = 15
 
 
-def find_employee_id(webhook_url, full_name):
-    """ID активного сотрудника по имени. При нескольких совпадениях берёт точное совпадение ФИО."""
-    call = bitrix_call(webhook_url, "user.search", {
-        "FILTER": {"FIND": full_name, "USER_TYPE": "employee", "ACTIVE": "Y"},
-    })
-    if not call["ok"] or not call["result"]:
-        return None
-    wanted = " ".join(full_name.lower().split())
-    for user in call["result"]:
-        name = " ".join(f"{user.get('LAST_NAME', '')} {user.get('NAME', '')}".lower().split())
-        reverse = " ".join(f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".lower().split())
-        if wanted in (name, reverse):
-            return int(user["ID"])
-    return int(call["result"][0]["ID"])
+class BitrixError(RuntimeError):
+    pass
 
 
-def get_busy_intervals(webhook_url, user_id, day, clinic_tz):
-    """Занятые интервалы врача на день во времени клиники.
+class Bitrix:
+    def __init__(self, webhook_url):
+        self.base = webhook_url.rstrip("/") + "/"
 
-    Каждое событие приводится к поясу клиники по полю TZ_FROM:
-    события, созданные из другого часового пояса, иначе сдвигаются на разницу поясов.
-    Обеды и перерывы в календаре тоже считаются занятым временем.
-    """
-    call = bitrix_call(webhook_url, "calendar.event.get", {
-        "type": "user",
-        "ownerId": str(user_id),
-        "from": datetime.datetime.combine(day, datetime.time.min).isoformat(),
-        "to": datetime.datetime.combine(day, datetime.time.max).isoformat(),
-    })
-    if not call["ok"]:
-        return {"ok": False, "busy": [], "error": call["error"]}
+    def call(self, method, params=None):
+        try:
+            response = requests.post(self.base + method, json=params or {}, timeout=TIMEOUT)
+            data = response.json()
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            raise BitrixError(f"{method}: {exc}") from exc
+        if response.status_code != 200 or "error" in data:
+            raise BitrixError(f"{method}: {data.get('error_description') or data.get('error') or response.status_code}")
+        return data.get("result")
 
-    busy = []
-    for event in call["result"] or []:
-        start = parse_datetime(event.get("DATE_FROM"))
-        end = parse_datetime(event.get("DATE_TO"))
-        if start is None or end is None:
-            continue
-        event_tz = event.get("TZ_FROM") or clinic_tz
-        busy.append({
-            "start": shift_timezone(start, event_tz, clinic_tz),
-            "end": shift_timezone(end, event_tz, clinic_tz),
+    # ---------------------------------------------------------------- чтение
+    def load_directory(self, entity_type_id, field_doctor_ids, field_doctor_names, pages=10):
+        """Справочник «Услуги и врачи» одним batch-запросом, по 50 строк на страницу."""
+        commands = {
+            f"p{page}": (f"crm.item.list?entityTypeId={entity_type_id}&start={page * 50}"
+                         f"&select[0]=id&select[1]={field_doctor_ids}&select[2]={field_doctor_names}")
+            for page in range(pages)
+        }
+        result = self.call("batch", {"halt": 0, "cmd": commands}) or {}
+        rows = []
+        for page in range(pages):
+            rows.extend(((result.get("result") or {}).get(f"p{page}") or {}).get("items") or [])
+        return build_directory(rows, field_doctor_ids, field_doctor_names)
+
+    def busy_intervals(self, user_id, first_day, last_day, clinic_tz):
+        """Занятые интервалы врача во времени клиники. Обеды и перерывы тоже занятость.
+
+        DATE_FROM приходит в поясе события (TZ_FROM), поэтому каждое событие
+        переводится в пояс клиники отдельно.
+        """
+        events = self.call("calendar.event.get", {
+            "type": "user",
+            "ownerId": str(user_id),
+            "from": datetime.datetime.combine(first_day, datetime.time.min).isoformat(),
+            "to": datetime.datetime.combine(last_day, datetime.time.max).isoformat(),
+        }) or []
+        busy = []
+        for event in events:
+            start = parse_bitrix_datetime(event.get("DATE_FROM"))
+            end = parse_bitrix_datetime(event.get("DATE_TO"))
+            if start is None or end is None:
+                continue
+            event_tz = event.get("TZ_FROM") or clinic_tz
+            busy.append({"start": to_clinic_time(start, event_tz, clinic_tz),
+                         "end": to_clinic_time(end, event.get("TZ_TO") or event_tz, clinic_tz)})
+        return busy
+
+    def lead_has_booking(self, lead_id, booking_fields):
+        lead = self.call("crm.lead.get", {"ID": int(lead_id)}) or {}
+        return any(lead.get(field) for field in booking_fields)
+
+    # ---------------------------------------------------------------- запись
+    def add_calendar_event(self, user_id, start, duration_minutes, clinic_tz, name, description):
+        """Событие прямо в календаре врача.
+
+        Пояс передаётся ключами timezone_from / timezone_to. Старые ключи tzFrom / tzTo
+        портал в какой-то момент начал молча игнорировать, и событие писалось в пояс
+        владельца вебхука со сдвигом на разницу поясов.
+        """
+        end = start + datetime.timedelta(minutes=duration_minutes)
+        sections = self.call("calendar.section.get", {"type": "user", "ownerId": int(user_id)}) or []
+        params = {
+            "type": "user",
+            "ownerId": int(user_id),
+            "from": start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "to": end.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timezone_from": clinic_tz,
+            "timezone_to": clinic_tz,
+            "name": name,
+            "description": description,
+            "skip_time": "N",
+            "accessibility": "busy",
+        }
+        if sections:
+            params["section"] = int(sections[0]["ID"])
+        return self.call("calendar.event.add", params)
+
+    def start_booking_workflow(self, template_id, lead_id, start, clinic_tz, owner_tz, parameters):
+        """Первая запись идёт бизнес-процессом на лиде: он создаёт событие и заполняет поля лида.
+
+        Бизнес-процесс понимает StartDate во времени владельца вебхука, поэтому время
+        клиники переводится в его пояс, а не сдвигается на зашитую разницу часов.
+        """
+        owner_start = start.replace(tzinfo=ZoneInfo(clinic_tz)).astimezone(ZoneInfo(owner_tz)).replace(tzinfo=None)
+        return self.call("bizproc.workflow.start", {
+            "TEMPLATE_ID": template_id,
+            "DOCUMENT_ID": ["crm", "CCrmDocumentLead", f"LEAD_{int(lead_id)}"],
+            "PARAMETERS": dict(parameters, StartDate=owner_start.isoformat()),
         })
-    return {"ok": True, "busy": busy, "error": None}
 
 
-def start_booking_workflow(webhook_url, template_id, deal_id, parameters):
-    """Запускает бизнес-процесс записи на сделке. Бизнес-процесс создаёт событие в календаре врача."""
-    call = bitrix_call(webhook_url, "bizproc.workflow.start", {
-        "TEMPLATE_ID": template_id,
-        "DOCUMENT_ID": ["crm", "CCrmDocumentDeal", f"DEAL_{deal_id}"],
-        "PARAMETERS": parameters,
-    })
-    if not call["ok"]:
-        return {"ok": False, "workflow_id": None, "error": call["error"]}
-    return {"ok": True, "workflow_id": call["result"], "error": None}
+"""Функции агента: check_time и create_appointment.
 
-"""Две функции для ИИ-агента: проверить время и записать пациента.
-
-Ответ каждой функции адресован модели: статус, факты и инструкция, что говорить клиенту.
-Главное правило: если запись не подтвердил Bitrix24, агент не подтверждает её клиенту.
+Ответ — в структурированном контракте платформы: tool_result читает модель,
+tags помечают диалог. Главное правило: если Bitrix24 не подтвердил запись,
+агент не подтверждает её пациенту.
 """
 
 
 DEFAULT_CONFIG = {
-    "webhook_url": "https://example.bitrix24.ru/rest/1/REPLACE_ME/",
-    "clinic_tz": "Asia/Yekaterinburg",
-    "work_start": "08:00",
-    "work_end": "20:00",
+    "clinic_tz": "Asia/Yekaterinburg",       # эталонный пояс: в нём ищем и называем время
+    "webhook_owner_tz": "Europe/Moscow",     # пояс пользователя, от имени которого вебхук
+    "work_start": datetime.time(8, 0),
+    "work_end": datetime.time(20, 0),
+    "min_lead_minutes": 30,                  # не предлагать слоты раньше, чем через 30 минут
+    "max_slots": 30,
+    "directory": {"entity_type_id": 0, "field_doctor_ids": "", "field_doctor_names": ""},
     "booking_template_id": 0,
-    "days_to_search": 3,
-    "slots_to_suggest": 3,
+    "lead_booking_fields": [],               # поля лида, заполненные первой записью
 }
 
 
-def parse_clock(value):
-    parts = value.split(":")
-    return datetime.time(int(parts[0]), int(parts[1]))
+def reply(status, instruction, tags=None, **facts):
+    payload = {"status": status, **facts, "instruction": instruction}
+    result = {"tool_result": json.dumps(payload, ensure_ascii=False, default=str)}
+    if tags:
+        result["tags"] = tags
+    return result
 
 
-def clinic_now(clinic_tz):
-    utc_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    return shift_timezone(utc_now, "UTC", clinic_tz)
+def failed(reason):
+    return reply("error", "Запись не создана. Не подтверждай время пациенту, передай диалог администратору.",
+                 tags=["booking_error"], reason=reason)
 
 
-def error_result(reason):
-    return {
-        "status": "error",
-        "reason": reason,
-        "instruction": "Запись не создана. Не подтверждай время клиенту. Передай диалог администратору.",
-    }
+def doctor_from_args(cfg, bitrix, args):
+    d = cfg["directory"]
+    directory = bitrix.load_directory(d["entity_type_id"], d["field_doctor_ids"], d["field_doctor_names"])
+    return resolve_doctor(directory, args.get("doctor_calendar_id"), args.get("doctor_name"))
 
 
-def collect_busy(config, doctor_id, first_day):
-    """Занятость врача на несколько дней вперёд: список пар [дата, интервалы]."""
-    days = []
-    for offset in range(config["days_to_search"]):
-        day = first_day + datetime.timedelta(days=offset)
-        loaded = get_busy_intervals(config["webhook_url"], doctor_id, day, config["clinic_tz"])
-        if not loaded["ok"]:
-            return {"ok": False, "days": [], "error": loaded["error"]}
-        days.append([day, loaded["busy"]])
-    return {"ok": True, "days": days, "error": None}
+def check_time(cfg, bitrix, args, now_utc=None):
+    """Свободные слоты врача в диапазоне start_time–end_time (ДД.ММ.ГГГГ ЧЧ:ММ)."""
+    try:
+        doctor_id, doctor_name, problem = doctor_from_args(cfg, bitrix, args)
+        if problem:
+            return reply("invalid", problem)
+        start = parse_bitrix_datetime(args.get("start_time"))
+        end = parse_bitrix_datetime(args.get("end_time"))
+        duration = int(args.get("appointment_duration") or 0)
+        if start is None or end is None or duration <= 0 or start >= end:
+            return reply("invalid", "Нужны start_time и end_time в формате ДД.ММ.ГГГГ ЧЧ:ММ и длительность больше нуля.")
+
+        not_before = clinic_now(cfg["clinic_tz"], now_utc) + datetime.timedelta(minutes=cfg["min_lead_minutes"])
+        busy = bitrix.busy_intervals(doctor_id, start.date(), end.date(), cfg["clinic_tz"])
+        slots = free_slots_in_range(busy, start, end, duration, cfg["work_start"], cfg["work_end"],
+                                    not_before=not_before, limit=cfg["max_slots"])
+    except BitrixError as exc:
+        return failed(str(exc))
+
+    if not slots:
+        return reply("no_slots", "В этом диапазоне свободного времени нет. Предложи другой день или другого врача.",
+                     doctor=doctor_name)
+    return reply("success", "Назови пациенту только эти варианты. Другого времени не предлагай.",
+                 doctor=doctor_name, doctor_calendar_id=doctor_id,
+                 slots=[format_for_patient(s) for s in slots])
 
 
-def validate_request(config, doctor_name, requested, duration_minutes):
-    """Проверки до обращения к календарю. Возвращает текст ошибки или None."""
-    if not doctor_name:
-        return "Не указан врач."
-    if requested is None:
-        return "Дата и время не распознаны. Ожидается ДД.ММ.ГГГГ ЧЧ:ММ."
-    if duration_minutes <= 0:
-        return "Длительность приёма должна быть больше нуля."
-    if requested < clinic_now(config["clinic_tz"]):
-        return "Запрошенное время уже прошло."
-    start = parse_clock(config["work_start"])
-    end = parse_clock(config["work_end"])
-    finish = requested + datetime.timedelta(minutes=duration_minutes)
-    if requested.time() < start or finish.time() > end or finish.date() != requested.date():
-        return f"Приём возможен с {config['work_start']} до {config['work_end']}."
-    return None
+def create_appointment(cfg, bitrix, args, now_utc=None):
+    """Запись пациента. Первая запись по лиду — бизнес-процессом, следующие — событием в календаре."""
+    try:
+        doctor_id, doctor_name, problem = doctor_from_args(cfg, bitrix, args)
+        if problem:
+            return reply("invalid", problem)
+        start = parse_bitrix_datetime(args.get("appointment_datetime"))
+        duration = int(args.get("appointment_duration") or 0)
+        lead_id = int(str(args.get("bitrixEntityId") or "").replace("LEAD_", "") or 0)
+        if start is None or duration <= 0 or not lead_id:
+            return reply("invalid", "Нужны время приёма ДД.ММ.ГГГГ ЧЧ:ММ, длительность и лид диалога.")
+        end = start + datetime.timedelta(minutes=duration)
+        if start < clinic_now(cfg["clinic_tz"], now_utc):
+            return reply("invalid", "Это время уже прошло. Предложи пациенту другое.")
+        if start.time() < cfg["work_start"] or end.time() > cfg["work_end"] or end.date() != start.date():
+            return reply("invalid", "Время вне часов приёма клиники.")
+
+        busy = bitrix.busy_intervals(doctor_id, start.date(), start.date(), cfg["clinic_tz"])
+        if not is_free(busy, start, end):
+            return reply("busy", "Время уже занято. Вызови check_time и предложи пациенту свободные варианты.")
+
+        service = str(args.get("medical_services") or "")
+        if bitrix.lead_has_booking(lead_id, cfg["lead_booking_fields"]):
+            # Повторная проверка прямо перед записью: слот могли занять за секунды разговора.
+            busy = bitrix.busy_intervals(doctor_id, start.date(), start.date(), cfg["clinic_tz"])
+            if not is_free(busy, start, end):
+                return reply("busy", "Слот только что заняли. Вызови check_time и предложи другое время.")
+            event_id = bitrix.add_calendar_event(
+                doctor_id, start, duration, cfg["clinic_tz"],
+                name=f"Доп. запись: {service} | лид {lead_id}",
+                description="Создано ИИ-агентом",
+            )
+            booking = {"calendar_event_id": event_id}
+        else:
+            workflow_id = bitrix.start_booking_workflow(
+                cfg["booking_template_id"], lead_id, start, cfg["clinic_tz"], cfg["webhook_owner_tz"],
+                {"Service": service, "Employee": f"user_{doctor_id}", "duration": duration},
+            )
+            booking = {"workflow_id": workflow_id}
+    except BitrixError as exc:
+        return failed(str(exc))
+
+    if not any(booking.values()):
+        return failed("Bitrix24 не вернул ID записи")
+    return reply("success", "Запись создана. Подтверди пациенту врача, дату и время.",
+                 tags=["booked"], doctor=doctor_name, slot=format_for_patient(start), **booking)
 
 
-def check_time(config, doctor_name, requested_text, duration_minutes):
-    """Функция агента check_time: свободно ли время и какие есть варианты."""
-    requested = parse_datetime(requested_text)
-    problem = validate_request(config, doctor_name, requested, duration_minutes)
-    if problem:
-        return {"status": "invalid", "reason": problem,
-                "instruction": "Уточни у клиента данные и вызови функцию снова."}
-
-    doctor_id = find_employee_id(config["webhook_url"], doctor_name)
-    if doctor_id is None:
-        return {"status": "invalid", "reason": f"Врач «{doctor_name}» не найден.",
-                "instruction": "Уточни у клиента имя врача по списку специалистов."}
-
-    loaded = collect_busy(config, doctor_id, requested.date())
-    if not loaded["ok"]:
-        return error_result(loaded["error"])
-
-    finish = requested + datetime.timedelta(minutes=duration_minutes)
-    if is_free(loaded["days"][0][1], requested, finish):
-        return {"status": "free", "slot": format_datetime(requested), "doctor_id": doctor_id,
-                "instruction": "Время свободно. Получи согласие клиента и вызови create_appointment."}
-
-    alternatives = suggest_alternatives(
-        loaded["days"], requested, duration_minutes,
-        parse_clock(config["work_start"]), parse_clock(config["work_end"]),
-        limit=config["slots_to_suggest"],
-    )
-    return {
-        "status": "busy",
-        "alternatives": [format_datetime(slot) for slot in alternatives],
-        "instruction": "Время занято. Предложи клиенту только эти варианты, другого времени не называй."
-        if alternatives else "Свободного времени в ближайшие дни нет. Предложи записаться к другому врачу.",
-    }
-
-
-def create_appointment(config, doctor_name, requested_text, duration_minutes, deal_id, service_name):
-    """Функция агента create_appointment: повторная проверка и запуск бизнес-процесса записи.
-
-    Время проверяется ещё раз прямо перед записью: между check_time и согласием клиента
-    слот мог занять администратор или другой пациент.
-    """
-    checked = check_time(config, doctor_name, requested_text, duration_minutes)
-    if checked["status"] != "free":
-        return checked
-
-    requested = parse_datetime(requested_text)
-    started = start_booking_workflow(
-        config["webhook_url"], config["booking_template_id"], deal_id,
-        {
-            "Service": service_name,
-            "StartDate": requested.isoformat(),
-            "Employee": f"user_{checked['doctor_id']}",
-            "Duration": duration_minutes,
-        },
-    )
-    if not started["ok"]:
-        return error_result(started["error"])
-    return {
-        "status": "success",
-        "slot": format_datetime(requested),
-        "workflow_id": started["workflow_id"],
-        "instruction": "Запись создана. Подтверди клиенту врача, дату и время.",
-    }
-
-# Точка входа функции create_appointment в NextBot.
-# scripts/build_nextbot.py ставит перед этим файлом код из booking/ без строк import.
-# args["bitrixEntityId"] NextBot передаёт сам: сделка диалога вида "DEAL_123".
+# Функция create_appointment для NextBot.
+# Параметры: doctor_calendar_id или doctor_name, appointment_datetime (ДД.ММ.ГГГГ ЧЧ:ММ),
+# appointment_duration, medical_services. bitrixEntityId платформа передаёт сама: лид диалога.
 
 CONFIG = dict(DEFAULT_CONFIG)
 CONFIG.update({
     "webhook_url": "https://example.bitrix24.ru/rest/1/REPLACE_ME/",
-    "clinic_tz": "Asia/Yekaterinburg",
+    "directory": {"entity_type_id": 0, "field_doctor_ids": "ufCrm0Doctors", "field_doctor_names": "ufCrm0DoctorFio"},
     "booking_template_id": 0,
+    "lead_booking_fields": ["UF_CRM_BOOKING_DATE"],
 })
 
-
-def deal_id_from_entity(value):
-    text = str(value or "")
-    if text.startswith("DEAL_"):
-        text = text[len("DEAL_"):]
-    return int(text) if text.isdigit() else None
-
-
-deal_id = deal_id_from_entity(args.get("bitrixEntityId"))
-if deal_id is None:
-    result = error_result("Нет сделки в Bitrix24 для этого диалога.")
-else:
-    result = create_appointment(
-        CONFIG,
-        args.get("doctor_name", ""),
-        args.get("appointment_datetime", ""),
-        int(args.get("duration_minutes") or 20),
-        deal_id,
-        args.get("service_name", ""),
-    )
+result = create_appointment(CONFIG, Bitrix(CONFIG["webhook_url"]), args)
